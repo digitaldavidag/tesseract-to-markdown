@@ -69,8 +69,22 @@ useful layout evidence, so raising this value should be an explicit decision.
 ```rust
 use tesseract_to_markdown::{
     MarkdownOptions,
+    analyze_tesseract_tsv,
     tesseract_tsv_to_markdown,
 };
+
+let analysis = analyze_tesseract_tsv(
+    &tsv,
+    &MarkdownOptions::default(),
+)?;
+for table in &analysis.tables {
+    eprintln!(
+        "table bbox={:?} columns={} coverage={:.3}",
+        table.bbox,
+        table.columns.len(),
+        table.diagnostics.assignment_coverage,
+    );
+}
 
 let result = tesseract_tsv_to_markdown(
     &tsv,
@@ -80,6 +94,13 @@ let result = tesseract_tsv_to_markdown(
 println!("{}", result.markdown);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+Table analysis is independent from Markdown rendering. Each table model exposes
+its page and region bounding box, inferred column geometry, row and cell
+provenance, recognition confidence, structural confidence, assignment coverage,
+and any cells excluded from or unassigned within the proposed grid. A grid with
+unassigned cells inside its table bounding box is rejected and its OCR text
+falls back to ordinary line rendering.
 
 ## Scope and limitations
 

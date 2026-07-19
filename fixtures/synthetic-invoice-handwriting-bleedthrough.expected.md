@@ -4,15 +4,28 @@ Forstbetrieb — Testbeleg
 
 ) SYNTHETISCHES TESTDOKUMENT - KEINE ECHTE RECHNUNG
 
-| Musterforst Falkenried, Beispielweg 12, 12345 Musterstadt |  | Rechnung: | TEST-9001/2026 |  |
-| --- | --- | --- | --- | --- |
-|  |  | Rechnungsdatum: |  | 15.07.2026 |
-| Sägewerk Beispielholz GmbH |  | Leistungsdatum: |  | 14.07.2026 |
-| Teststraße 8 |  | Zahlungsfrist: |  | 14.08.2026 |
-| se |  | Kundennummer: |  | K-0004711 |
-|  |  | Vertragsnummer: |  | V-TEST-204 |
-|  | A | Steuernummer: | TEST-NICHT-GULTIG |  |
-| 3 18 | 2 y 16 | Kassenzeichen: |  | KZ-9001-XY |
+Musterforst Falkenried, Beispielweg 12, 12345 Musterstadt
+
+Sägewerk Beispielholz GmbH
+
+Teststraße 8
+
+se ar
+
+A
+
+3 18 2 y 16
+
+| Field | Value |
+| --- | --- |
+| Rechnung: | TEST-9001/2026 |
+| Rechnungsdatum: | 15.07.2026 |
+| Leistungsdatum: | 14.07.2026 |
+| Zahlungsfrist: | 14.08.2026 |
+| Kundennummer: | K-0004711 |
+| Vertragsnummer: | V-TEST-204 |
+| Steuernummer: | TEST-NICHT-GULTIG |
+| Kassenzeichen: | KZ-9001-XY |
 
 Rechnung: TEST-9001/2026
 

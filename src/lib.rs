@@ -30,6 +30,12 @@ pub struct TesseractBox {
     pub height: f64,
 }
 
+impl TesseractBox {
+    fn right(&self) -> f64 {
+        self.left + self.width
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TesseractWord {
     pub page_number: u32,
@@ -93,6 +99,76 @@ pub struct MarkdownResult {
     pub stats: MarkdownStats,
 }
 
+/// Horizontal evidence used to infer a table column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableColumnGeometry {
+    LeftAligned,
+    RightAligned,
+}
+
+/// Stable reference back to one Tesseract `level=5` word row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableWordProvenance {
+    pub block_number: u32,
+    pub paragraph_number: u32,
+    pub line_number: u32,
+    pub word_number: u32,
+}
+
+/// One OCR cell retained in an inferred table row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCellModel {
+    pub text: String,
+    pub bbox: TesseractBox,
+    pub column_index: Option<usize>,
+    pub recognition_confidence: f64,
+    pub words: Vec<TableWordProvenance>,
+}
+
+/// One visual row in an inferred table region.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableRowModel {
+    pub bbox: TesseractBox,
+    pub cells: Vec<TableCellModel>,
+}
+
+/// Geometry and rendering alignment for an inferred table column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableColumnModel {
+    pub anchor: f64,
+    pub geometry: TableColumnGeometry,
+    pub numeric: bool,
+}
+
+/// Objective evidence supporting or rejecting a proposed table grid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableDiagnostics {
+    pub accepted: bool,
+    pub assigned_cell_count: usize,
+    pub unassigned_cell_count: usize,
+    pub excluded_non_table_cell_count: usize,
+    pub assignment_coverage: f64,
+    pub structural_confidence: f64,
+    pub recognition_confidence: f64,
+    pub notes: Vec<String>,
+}
+
+/// Inspectable table-region model produced before Markdown rendering.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableRegionModel {
+    pub page_number: u32,
+    pub bbox: TesseractBox,
+    pub columns: Vec<TableColumnModel>,
+    pub rows: Vec<TableRowModel>,
+    pub diagnostics: TableDiagnostics,
+}
+
+/// Layout analysis produced independently from Markdown rendering.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TesseractLayoutAnalysis {
+    pub tables: Vec<TableRegionModel>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TsvError {
     MissingColumns(Vec<String>),
@@ -119,6 +195,10 @@ struct LayoutCell {
     text: String,
     left: f64,
     right: f64,
+    top: f64,
+    bottom: f64,
+    confidence: f64,
+    words: Vec<TesseractWord>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +220,8 @@ struct TableGrid {
     alignments: Vec<ColumnAlignment>,
     rows: Vec<Vec<String>>,
     unassigned_cell_count: usize,
+    model: TableRegionModel,
+    cell_assignments: Vec<Vec<Option<usize>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +241,26 @@ struct AnchorCluster {
     sum: f64,
     count: usize,
     rows: HashSet<usize>,
+    cells: HashSet<(usize, usize)>,
+    deviation: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    Left,
+    Right,
+}
+
+struct EdgeCluster {
+    anchor: AnchorCluster,
+    edge: Edge,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnGeometry {
+    anchor: f64,
+    edge: Edge,
+    center: f64,
 }
 
 fn median(mut values: Vec<f64>, fallback: f64) -> f64 {
@@ -288,11 +390,8 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Result<TesseractTsvParseResult, TsvErro
             continue;
         }
 
-        let text = field("text")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if text.is_empty() {
+        let text = field("text").to_owned();
+        if text.trim().is_empty() {
             continue;
         }
 
@@ -402,7 +501,7 @@ fn words_to_text(words: &[TesseractWord]) -> String {
     result.trim().to_owned()
 }
 
-fn split_cells(words: &[TesseractWord], page_width: f64) -> Vec<LayoutCell> {
+fn split_cells(words: &[TesseractWord], page_width: f64, min_confidence: f64) -> Vec<LayoutCell> {
     if words.is_empty() {
         return Vec::new();
     }
@@ -433,16 +532,48 @@ fn split_cells(words: &[TesseractWord], page_width: f64) -> Vec<LayoutCell> {
 
     groups
         .into_iter()
-        .map(|group| LayoutCell {
-            left: group
+        .map(|group| {
+            let left = group
                 .iter()
                 .map(|word| word.bbox.left)
-                .fold(f64::INFINITY, f64::min),
-            right: group
+                .fold(f64::INFINITY, f64::min);
+            let right = group
                 .iter()
                 .map(word_right)
-                .fold(f64::NEG_INFINITY, f64::max),
-            text: words_to_text(&group),
+                .fold(f64::NEG_INFINITY, f64::max);
+            let top = group
+                .iter()
+                .map(|word| word.bbox.top)
+                .fold(f64::INFINITY, f64::min);
+            let bottom = group
+                .iter()
+                .map(word_bottom)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let total_width: f64 = group.iter().map(|word| word.bbox.width).sum();
+            let confidence = if total_width > 0.0 {
+                group
+                    .iter()
+                    .map(|word| word.confidence * word.bbox.width)
+                    .sum::<f64>()
+                    / total_width
+            } else {
+                median(group.iter().map(|word| word.confidence).collect(), 0.0)
+            };
+            LayoutCell {
+                left,
+                right,
+                top,
+                bottom,
+                confidence,
+                text: words_to_text(
+                    &group
+                        .iter()
+                        .filter(|word| word.confidence >= min_confidence)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                words: group,
+            }
         })
         .collect()
 }
@@ -451,24 +582,22 @@ fn build_layout_lines(
     page: &TesseractPage,
     min_confidence: f64,
 ) -> (Vec<LayoutLine>, Vec<TesseractWord>) {
-    let confidence_words: Vec<TesseractWord> = page
+    let body_height = median(
+        page.words.iter().map(|word| word.bbox.height).collect(),
+        16.0,
+    );
+    let structural_words: Vec<TesseractWord> = page
         .words
+        .iter()
+        .filter(|word| !is_obvious_graphic_artifact(word, body_height))
+        .cloned()
+        .collect();
+    let retained_words: Vec<TesseractWord> = structural_words
         .iter()
         .filter(|word| word.confidence >= min_confidence)
         .cloned()
         .collect();
-    let body_height = median(
-        confidence_words
-            .iter()
-            .map(|word| word.bbox.height)
-            .collect(),
-        16.0,
-    );
-    let retained_words: Vec<TesseractWord> = confidence_words
-        .into_iter()
-        .filter(|word| !is_obvious_graphic_artifact(word, body_height))
-        .collect();
-    let mut ordered = retained_words.clone();
+    let mut ordered = structural_words;
     ordered.sort_by(|left, right| {
         word_center_y(left)
             .total_cmp(&word_center_y(right))
@@ -523,7 +652,11 @@ fn build_layout_lines(
                 bottom: word_bottom(&word),
                 height: word.bbox.height,
                 confidence: word.confidence,
-                text: word.text.clone(),
+                text: if word.confidence >= min_confidence {
+                    word.text.clone()
+                } else {
+                    String::new()
+                },
                 cells: Vec::new(),
                 words: vec![word],
             });
@@ -537,8 +670,15 @@ fn build_layout_lines(
                 .total_cmp(&right.bbox.left)
                 .then(left.word_number.cmp(&right.word_number))
         });
-        line.cells = split_cells(&line.words, page.width);
-        line.text = words_to_text(&line.words);
+        line.cells = split_cells(&line.words, page.width, min_confidence);
+        line.text = words_to_text(
+            &line
+                .words
+                .iter()
+                .filter(|word| word.confidence >= min_confidence)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         line.top = median(
             line.words.iter().map(|word| word.bbox.top).collect(),
             line.top,
@@ -647,6 +787,8 @@ fn cluster_column_anchors(lines: &[LayoutLine], page_width: f64) -> Vec<f64> {
                 sum: x,
                 count: 1,
                 rows: HashSet::from([row]),
+                cells: HashSet::new(),
+                deviation: 0.0,
             });
         }
     }
@@ -668,33 +810,304 @@ fn cluster_column_anchors(lines: &[LayoutLine], page_width: f64) -> Vec<f64> {
     anchors
 }
 
-fn build_table_grid(lines: &[LayoutLine], page_width: f64) -> Option<TableGrid> {
-    let anchors = cluster_column_anchors(lines, page_width);
-    if anchors.len() < 2 {
+fn cluster_column_edges(lines: &[LayoutLine], page_width: f64) -> Vec<EdgeCluster> {
+    let body_height = median(lines.iter().map(|line| line.height).collect(), 16.0);
+    let tolerance = 12.0_f64.max(body_height).max(page_width * 0.012);
+    let mut result = Vec::new();
+
+    for edge in [Edge::Left, Edge::Right] {
+        let mut points: Vec<(f64, usize, usize)> = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.cells.iter().enumerate().map(move |(cell, value)| {
+                    (
+                        if edge == Edge::Left {
+                            value.left
+                        } else {
+                            value.right
+                        },
+                        row,
+                        cell,
+                    )
+                })
+            })
+            .collect();
+        points.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let mut clusters: Vec<AnchorCluster> = Vec::new();
+
+        for (x, row, cell) in points {
+            let nearest = clusters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cluster)| {
+                    let distance = (cluster.sum / cluster.count as f64 - x).abs();
+                    (distance <= tolerance).then_some((index, distance))
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1));
+            if let Some((index, distance)) = nearest {
+                let cluster = &mut clusters[index];
+                cluster.sum += x;
+                cluster.count += 1;
+                cluster.rows.insert(row);
+                cluster.cells.insert((row, cell));
+                cluster.deviation += distance;
+            } else {
+                clusters.push(AnchorCluster {
+                    sum: x,
+                    count: 1,
+                    rows: HashSet::from([row]),
+                    cells: HashSet::from([(row, cell)]),
+                    deviation: 0.0,
+                });
+            }
+        }
+        result.extend(
+            clusters
+                .into_iter()
+                .map(|anchor| EdgeCluster { anchor, edge }),
+        );
+    }
+    result
+}
+
+fn cell_at(lines: &[LayoutLine], location: (usize, usize)) -> &LayoutCell {
+    &lines[location.0].cells[location.1]
+}
+
+fn shared_cell_ratio(left: &EdgeCluster, right: &EdgeCluster) -> f64 {
+    let shared = left.anchor.cells.intersection(&right.anchor.cells).count();
+    shared as f64 / left.anchor.cells.len().min(right.anchor.cells.len()).max(1) as f64
+}
+
+fn infer_column_geometry(lines: &[LayoutLine], page_width: f64) -> Vec<ColumnGeometry> {
+    let support = (lines.len() * 7).div_ceil(10).max(2);
+    let candidates: Vec<EdgeCluster> = cluster_column_edges(lines, page_width)
+        .into_iter()
+        .filter(|cluster| cluster.anchor.rows.len() >= support)
+        .collect();
+    let mut consumed = HashSet::new();
+    let mut columns = Vec::new();
+
+    for index in 0..candidates.len() {
+        if consumed.contains(&index) {
+            continue;
+        }
+        let mut group = vec![index];
+        consumed.insert(index);
+        let mut cursor = 0;
+        while cursor < group.len() {
+            let member = group[cursor];
+            for other in 0..candidates.len() {
+                if !consumed.contains(&other)
+                    && shared_cell_ratio(&candidates[member], &candidates[other]) >= 0.65
+                {
+                    consumed.insert(other);
+                    group.push(other);
+                }
+            }
+            cursor += 1;
+        }
+
+        let cells: HashSet<(usize, usize)> = group
+            .iter()
+            .flat_map(|candidate| candidates[*candidate].anchor.cells.iter().copied())
+            .collect();
+        let numeric_ratio = cells
+            .iter()
+            .filter(|location| looks_numeric(&cell_at(lines, **location).text))
+            .count() as f64
+            / cells.len().max(1) as f64;
+        let preferred_edge = if numeric_ratio >= 0.6 {
+            Edge::Right
+        } else {
+            Edge::Left
+        };
+        let best = group
+            .iter()
+            .map(|candidate| &candidates[*candidate])
+            .filter(|candidate| candidate.edge == preferred_edge)
+            .max_by(|left, right| {
+                left.anchor
+                    .rows
+                    .len()
+                    .cmp(&right.anchor.rows.len())
+                    .then_with(|| right.anchor.deviation.total_cmp(&left.anchor.deviation))
+            })
+            .or_else(|| {
+                group
+                    .iter()
+                    .map(|candidate| &candidates[*candidate])
+                    .max_by_key(|candidate| candidate.anchor.rows.len())
+            })
+            .expect("column candidate group is not empty");
+        let centers: Vec<f64> = best
+            .anchor
+            .cells
+            .iter()
+            .map(|location| {
+                let cell = cell_at(lines, *location);
+                cell.left.midpoint(cell.right)
+            })
+            .collect();
+        columns.push(ColumnGeometry {
+            anchor: best.anchor.sum / best.anchor.count as f64,
+            edge: best.edge,
+            center: median(centers, best.anchor.sum / best.anchor.count as f64),
+        });
+    }
+
+    columns.sort_by(|left, right| left.center.total_cmp(&right.center));
+    columns
+}
+
+fn column_bounds(columns: &[ColumnGeometry], index: usize, page_width: f64) -> (f64, f64) {
+    let outer_margin = 50.0_f64.max(page_width * 0.045);
+    let left = if index == 0 {
+        columns[index].center - outer_margin
+    } else {
+        columns[index - 1].center.midpoint(columns[index].center)
+    };
+    let right = if index + 1 == columns.len() {
+        columns[index].center + outer_margin
+    } else {
+        columns[index].center.midpoint(columns[index + 1].center)
+    };
+    (left, right)
+}
+
+fn assign_cell(cell: &LayoutCell, columns: &[ColumnGeometry], page_width: f64) -> Option<usize> {
+    let tolerance = 20.0_f64.max(page_width * 0.02);
+    columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            let (left, right) = column_bounds(columns, index, page_width);
+            let overlap = (cell.right.min(right) - cell.left.max(left)).max(0.0);
+            let overlap_ratio = overlap / (cell.right - cell.left).max(1.0);
+            let edge_distance = match column.edge {
+                Edge::Left => (cell.left - column.anchor).abs(),
+                Edge::Right => (cell.right - column.anchor).abs(),
+            };
+            if overlap_ratio < 0.25 && edge_distance > tolerance {
+                return None;
+            }
+            let center_distance = (cell.left.midpoint(cell.right) - column.center).abs();
+            let score = edge_distance / tolerance + center_distance / page_width.max(1.0)
+                - overlap_ratio * 2.0;
+            Some((index, score))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, _)| index)
+}
+
+fn numeric_ratio<'a>(values: impl Iterator<Item = &'a String>) -> f64 {
+    let values: Vec<&String> = values.filter(|value| !value.is_empty()).collect();
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().filter(|value| looks_numeric(value)).count() as f64 / values.len() as f64
+    }
+}
+
+fn box_for_cells<'a>(cells: impl Iterator<Item = &'a LayoutCell>) -> Option<TesseractBox> {
+    let cells: Vec<&LayoutCell> = cells.collect();
+    if cells.is_empty() {
         return None;
     }
-    let body_height = median(lines.iter().map(|line| line.height).collect(), 16.0);
-    let assignment_tolerance = 30.0_f64.max(body_height * 2.4).max(page_width * 0.045);
-    let mut unassigned_cell_count = 0;
-    let mut rows: Vec<Vec<String>> = lines
+    let left = cells
+        .iter()
+        .map(|cell| cell.left)
+        .fold(f64::INFINITY, f64::min);
+    let top = cells
+        .iter()
+        .map(|cell| cell.top)
+        .fold(f64::INFINITY, f64::min);
+    let right = cells
+        .iter()
+        .map(|cell| cell.right)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let bottom = cells
+        .iter()
+        .map(|cell| cell.bottom)
+        .fold(f64::NEG_INFINITY, f64::max);
+    Some(TesseractBox {
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+fn build_table_grid(lines: &[LayoutLine], page_number: u32, page_width: f64) -> Option<TableGrid> {
+    let mut columns = infer_column_geometry(lines, page_width);
+    if columns.len() < 2 {
+        return None;
+    }
+
+    let tentative_assignments: Vec<Vec<Option<usize>>> = lines
         .iter()
         .map(|line| {
-            let mut values = vec![String::new(); anchors.len()];
-            for cell in &line.cells {
-                let (best_index, best_distance) = anchors
-                    .iter()
-                    .enumerate()
-                    .map(|(index, anchor)| (index, (anchor - cell.left).abs()))
-                    .min_by(|left, right| left.1.total_cmp(&right.1))
-                    .expect("table anchors are not empty");
-                if best_distance > assignment_tolerance {
-                    unassigned_cell_count += 1;
-                    continue;
+            line.cells
+                .iter()
+                .map(|cell| assign_cell(cell, &columns, page_width))
+                .collect()
+        })
+        .collect();
+    let tentative_rows: Vec<Vec<String>> = lines
+        .iter()
+        .zip(&tentative_assignments)
+        .map(|(line, assignments)| {
+            let mut values = vec![String::new(); columns.len()];
+            for (cell, assignment) in line.cells.iter().zip(assignments) {
+                if let Some(column) = assignment {
+                    if !values[*column].is_empty() {
+                        values[*column].push(' ');
+                    }
+                    values[*column].push_str(&cell.text);
                 }
-                if !values[best_index].is_empty() {
-                    values[best_index].push(' ');
+            }
+            values
+        })
+        .collect();
+    let first_numeric_ratio = numeric_ratio(tentative_rows[0].iter());
+    let later_numeric_ratio = numeric_ratio(tentative_rows.iter().skip(1).flatten());
+    let first_looks_like_header =
+        first_numeric_ratio < 0.35 && later_numeric_ratio > first_numeric_ratio + 0.15;
+    if first_looks_like_header && columns.len() >= 3 {
+        for (cell, assignment) in lines[0].cells.iter().zip(&tentative_assignments[0]) {
+            if assignment.is_none() {
+                columns.push(ColumnGeometry {
+                    anchor: cell.left,
+                    edge: Edge::Left,
+                    center: cell.left.midpoint(cell.right),
+                });
+            }
+        }
+        columns.sort_by(|left, right| left.center.total_cmp(&right.center));
+    }
+
+    let cell_assignments: Vec<Vec<Option<usize>>> = lines
+        .iter()
+        .map(|line| {
+            line.cells
+                .iter()
+                .map(|cell| assign_cell(cell, &columns, page_width))
+                .collect()
+        })
+        .collect();
+    let mut rows: Vec<Vec<String>> = lines
+        .iter()
+        .zip(&cell_assignments)
+        .map(|(line, assignments)| {
+            let mut values = vec![String::new(); columns.len()];
+            for (cell, assignment) in line.cells.iter().zip(assignments) {
+                if let Some(column) = assignment {
+                    if !values[*column].is_empty() {
+                        values[*column].push(' ');
+                    }
+                    values[*column].push_str(&cell.text);
                 }
-                values[best_index].push_str(&cell.text);
             }
             values
         })
@@ -715,35 +1128,10 @@ fn build_table_grid(lines: &[LayoutLine], page_width: f64) -> Option<TableGrid> 
         .iter()
         .filter(|row| !row[0].is_empty() && !looks_numeric(&row[0]))
         .count();
-    let key_value = anchors.len() == 2
+    let key_value = columns.len() == 2
         && paired_rows >= 2.max(rows.len().div_ceil(2))
         && non_numeric_first >= rows.len().div_ceil(2);
 
-    let first_non_empty: Vec<&String> = rows[0].iter().filter(|value| !value.is_empty()).collect();
-    let first_numeric_ratio = if first_non_empty.is_empty() {
-        1.0
-    } else {
-        first_non_empty
-            .iter()
-            .filter(|value| looks_numeric(value))
-            .count() as f64
-            / first_non_empty.len() as f64
-    };
-    let later_values: Vec<&String> = rows
-        .iter()
-        .skip(1)
-        .flat_map(|row| row.iter())
-        .filter(|value| !value.is_empty())
-        .collect();
-    let later_numeric_ratio = if later_values.is_empty() {
-        0.0
-    } else {
-        later_values
-            .iter()
-            .filter(|value| looks_numeric(value))
-            .count() as f64
-            / later_values.len() as f64
-    };
     let first_looks_like_header = !key_value
         && first_numeric_ratio < 0.35
         && later_numeric_ratio > first_numeric_ratio + 0.15;
@@ -753,7 +1141,7 @@ fn build_table_grid(lines: &[LayoutLine], page_width: f64) -> Option<TableGrid> 
     } else if first_looks_like_header {
         rows.remove(0)
     } else {
-        (1..=anchors.len())
+        (1..=columns.len())
             .map(|index| format!("Column {index}"))
             .collect()
     };
@@ -786,7 +1174,7 @@ fn build_table_grid(lines: &[LayoutLine], page_width: f64) -> Option<TableGrid> 
     } else {
         rows.as_slice()
     };
-    let alignments = (0..anchors.len())
+    let alignments = (0..columns.len())
         .map(|column| {
             let values: Vec<&String> = alignment_samples
                 .iter()
@@ -804,13 +1192,164 @@ fn build_table_grid(lines: &[LayoutLine], page_width: f64) -> Option<TableGrid> 
                 ColumnAlignment::Left
             }
         })
+        .collect::<Vec<_>>();
+
+    let assigned_cells: Vec<&LayoutCell> = lines
+        .iter()
+        .zip(&cell_assignments)
+        .flat_map(|(line, assignments)| {
+            line.cells
+                .iter()
+                .zip(assignments)
+                .filter_map(|(cell, assignment)| assignment.is_some().then_some(cell))
+        })
         .collect();
+    let bbox = box_for_cells(assigned_cells.iter().copied())?;
+    let overlaps_table = |cell: &LayoutCell| {
+        let overlap = (cell.right.min(bbox.right()) - cell.left.max(bbox.left)).max(0.0);
+        overlap / (cell.right - cell.left).max(1.0) >= 0.25
+    };
+    let assigned_cell_count = cell_assignments
+        .iter()
+        .flatten()
+        .filter(|assignment| assignment.is_some())
+        .count();
+    let unassigned_cell_count = lines
+        .iter()
+        .zip(&cell_assignments)
+        .flat_map(|(line, assignments)| line.cells.iter().zip(assignments))
+        .filter(|(cell, assignment)| assignment.is_none() && overlaps_table(cell))
+        .count();
+    let excluded_non_table_cell_count = lines
+        .iter()
+        .zip(&cell_assignments)
+        .flat_map(|(line, assignments)| line.cells.iter().zip(assignments))
+        .filter(|(cell, assignment)| assignment.is_none() && !overlaps_table(cell))
+        .count();
+    let assignment_coverage =
+        assigned_cell_count as f64 / (assigned_cell_count + unassigned_cell_count).max(1) as f64;
+    let recognition_confidence = if assigned_cells.is_empty() {
+        0.0
+    } else {
+        assigned_cells
+            .iter()
+            .map(|cell| cell.confidence)
+            .sum::<f64>()
+            / assigned_cells.len() as f64
+    };
+    let row_pitch = median(
+        lines
+            .windows(2)
+            .map(|pair| pair[1].top - pair[0].top)
+            .filter(|distance| *distance > 0.0)
+            .collect(),
+        1.0,
+    );
+    let rhythm_consistency = if lines.len() < 3 {
+        1.0
+    } else {
+        let consistent = lines
+            .windows(2)
+            .map(|pair| pair[1].top - pair[0].top)
+            .filter(|distance| (*distance - row_pitch).abs() <= row_pitch.max(1.0) * 0.35)
+            .count();
+        consistent as f64 / (lines.len() - 1) as f64
+    };
+    let structural_confidence = assignment_coverage * 0.75 + rhythm_consistency * 0.25;
+    let accepted = assignment_coverage >= 0.95 && unassigned_cell_count == 0;
+    let mut notes = Vec::new();
+    if excluded_non_table_cell_count > 0 {
+        notes.push(format!(
+            "{excluded_non_table_cell_count} cells remain outside the supported table bbox"
+        ));
+    }
+    if !accepted {
+        notes.push("grid rejected because cells inside its bbox were unassigned".to_owned());
+    }
+
+    let model_rows = lines
+        .iter()
+        .zip(&cell_assignments)
+        .map(|(line, assignments)| {
+            let cells: Vec<TableCellModel> = line
+                .cells
+                .iter()
+                .zip(assignments)
+                .filter(|(cell, assignment)| assignment.is_some() || overlaps_table(cell))
+                .map(|(cell, assignment)| TableCellModel {
+                    text: cell.text.clone(),
+                    bbox: TesseractBox {
+                        left: cell.left,
+                        top: cell.top,
+                        width: cell.right - cell.left,
+                        height: cell.bottom - cell.top,
+                    },
+                    column_index: *assignment,
+                    recognition_confidence: cell.confidence,
+                    words: cell
+                        .words
+                        .iter()
+                        .map(|word| TableWordProvenance {
+                            block_number: word.block_number,
+                            paragraph_number: word.paragraph_number,
+                            line_number: word.line_number,
+                            word_number: word.word_number,
+                        })
+                        .collect(),
+                })
+                .collect();
+            let bbox = box_for_cells(
+                line.cells
+                    .iter()
+                    .zip(assignments)
+                    .filter(|(_, assignment)| assignment.is_some())
+                    .map(|(cell, _)| cell),
+            )
+            .unwrap_or(TesseractBox {
+                left: line.left,
+                top: line.top,
+                width: line.right - line.left,
+                height: line.bottom - line.top,
+            });
+            TableRowModel { bbox, cells }
+        })
+        .collect();
+    let column_models = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| TableColumnModel {
+            anchor: column.anchor,
+            geometry: match column.edge {
+                Edge::Left => TableColumnGeometry::LeftAligned,
+                Edge::Right => TableColumnGeometry::RightAligned,
+            },
+            numeric: matches!(alignments[index], ColumnAlignment::Right),
+        })
+        .collect();
+    let model = TableRegionModel {
+        page_number,
+        bbox,
+        columns: column_models,
+        rows: model_rows,
+        diagnostics: TableDiagnostics {
+            accepted,
+            assigned_cell_count,
+            unassigned_cell_count,
+            excluded_non_table_cell_count,
+            assignment_coverage,
+            structural_confidence,
+            recognition_confidence,
+            notes,
+        },
+    };
 
     Some(TableGrid {
         headers,
         alignments,
         rows,
         unassigned_cell_count,
+        model,
+        cell_assignments,
     })
 }
 
@@ -907,7 +1446,7 @@ fn find_tables(lines: &[LayoutLine], page: &TesseractPage, table_min_rows: usize
         for schema in split_table_schemas(candidate, page, table_min_rows) {
             let schema_to = schema_from + schema.len();
             if schema.len() >= table_min_rows
-                && let Some(grid) = build_table_grid(&schema, page.width)
+                && let Some(grid) = build_table_grid(&schema, page.page_number, page.width)
             {
                 runs.push(TableRun {
                     from: schema_from,
@@ -982,6 +1521,24 @@ fn render_table(grid: &TableGrid) -> String {
         .chain(grid.rows.iter().map(|row| render_row(row)))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_residual_cells(lines: &[LayoutLine], grid: &TableGrid) -> Vec<String> {
+    lines
+        .iter()
+        .zip(&grid.cell_assignments)
+        .filter_map(|(line, assignments)| {
+            let text = line
+                .cells
+                .iter()
+                .zip(assignments)
+                .filter(|(_, assignment)| assignment.is_none())
+                .map(|(cell, _)| cell.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!text.is_empty()).then(|| escape_inline(&text))
+        })
+        .collect()
 }
 
 fn heading_level(line: &LayoutLine, body_height: f64) -> Option<usize> {
@@ -1065,12 +1622,19 @@ pub fn tesseract_pages_to_markdown(
             16.0,
         );
         let tables = find_tables(&lines, page, table_min_rows);
-        let tables_by_start: HashMap<usize, &TableRun> =
-            tables.iter().map(|table| (table.from, table)).collect();
+        let tables_by_start: HashMap<usize, &TableRun> = tables
+            .iter()
+            .filter(|table| table.grid.model.diagnostics.accepted)
+            .map(|table| (table.from, table))
+            .collect();
         let mut blocks = Vec::new();
         let mut index = 0;
         while index < lines.len() {
             if let Some(table) = tables_by_start.get(&index) {
+                blocks.extend(render_residual_cells(
+                    &lines[table.from..table.to],
+                    &table.grid,
+                ));
                 blocks.push(render_table(&table.grid));
                 stats.table_count += 1;
                 stats.unassigned_table_cell_count += table.grid.unassigned_cell_count;
@@ -1106,6 +1670,39 @@ pub fn tesseract_pages_to_markdown(
         markdown: format!("{}\n", output.join("\n\n").trim()),
         stats,
     }
+}
+
+/// Analyze table regions without rendering Markdown.
+#[must_use]
+pub fn analyze_tesseract_pages(
+    pages: &[TesseractPage],
+    options: &MarkdownOptions,
+) -> TesseractLayoutAnalysis {
+    let table_min_rows = options.table_min_rows.max(2);
+    let tables = pages
+        .iter()
+        .flat_map(|page| {
+            let (lines, _) = build_layout_lines(page, options.min_confidence);
+            find_tables(&lines, page, table_min_rows)
+                .into_iter()
+                .map(|table| table.grid.model)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    TesseractLayoutAnalysis { tables }
+}
+
+/// Parse Tesseract TSV and analyze table regions without rendering Markdown.
+///
+/// # Errors
+///
+/// Returns [`TsvError`] when the TSV header is invalid.
+pub fn analyze_tesseract_tsv(
+    tsv: &str,
+    options: &MarkdownOptions,
+) -> Result<TesseractLayoutAnalysis, TsvError> {
+    let parsed = parse_tesseract_tsv(tsv)?;
+    Ok(analyze_tesseract_pages(&parsed.pages, options))
 }
 
 /// Parse Tesseract TSV and convert it into Markdown.
