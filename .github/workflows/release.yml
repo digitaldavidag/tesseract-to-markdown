@@ -71,7 +71,7 @@ jobs:
           cp LICENSE README.md "$package/"
           printf '%s\n' "$TESSERACT_TO_MARKDOWN_BUILD_VERSION" > "$package/VERSION"
           tar -czf "$package.tar.gz" "$package"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tesseract-to-markdown-${{ matrix.asset }}
           path: tesseract-to-markdown-${{ matrix.asset }}.tar.gz
@@ -138,7 +138,7 @@ jobs:
             install -m 0755 "$binary" "$package/tesseract-to-markdown"
             tar -czf "$package.tar.gz" "$package"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tesseract-to-markdown-macos
           path: tesseract-to-markdown-macos-*.tar.gz
@@ -154,7 +154,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
