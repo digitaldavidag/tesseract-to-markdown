@@ -1,0 +1,28 @@
+[package]
+name = "tesseract-to-markdown"
+version = "0.1.0"
+edition = "2024"
+description = "Convert Tesseract TSV layout output into GitHub-Flavored Markdown"
+license = "MIT"
+repository = "https://github.com/digitaldavidag/tesseract-to-markdown"
+keywords = ["tesseract", "ocr", "markdown", "gfm", "tables"]
+categories = ["command-line-utilities", "text-processing"]
+
+[lib]
+name = "tesseract_to_markdown"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tesseract-to-markdown"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_precision_loss = "allow"
+too_many_lines = "allow"
