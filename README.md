@@ -7,6 +7,35 @@ The converter reconstructs visual lines from word boxes, detects repeated table
 geometry, separates adjacent column schemas, preserves sparse leading cells, and
 emits GFM tables with numeric alignment. It does not silently correct OCR text.
 
+## Install a release
+
+Every successful change on `main` creates a [GitHub release](https://github.com/digitaldavidag/tesseract-to-markdown/releases/latest)
+with ready-to-run binaries. Download and extract one of these archives:
+
+- `tesseract-to-markdown-linux-x86_64.tar.gz` for Intel/AMD Linux servers
+- `tesseract-to-markdown-linux-aarch64.tar.gz` for ARM64 Linux servers
+- `tesseract-to-markdown-macos-universal.tar.gz` for any modern Mac
+- `tesseract-to-markdown-macos-aarch64.tar.gz` for Apple Silicon only
+- `tesseract-to-markdown-macos-x86_64.tar.gz` for Intel Macs only
+
+The Linux executables are statically linked. The universal macOS executable
+contains both Apple Silicon and Intel code and is the recommended Mac download.
+
+Because this repository is private, authenticated command-line downloads use
+the GitHub CLI:
+
+```bash
+gh release download --repo digitaldavidag/tesseract-to-markdown \
+  --pattern 'tesseract-to-markdown-macos-universal.tar.gz'
+tar -xzf tesseract-to-markdown-macos-universal.tar.gz
+sudo install -m 0755 \
+  tesseract-to-markdown-macos-universal/tesseract-to-markdown \
+  /usr/local/bin/tesseract-to-markdown
+```
+
+Replace the archive pattern and extracted directory with a Linux target when
+installing on a server. Each release also includes `SHA256SUMS`.
+
 ## CLI
 
 Generate TSV with Tesseract and pipe it into the converter:
@@ -29,6 +58,7 @@ Available options:
 --table-min-rows N
 --page-headings
 --stats
+-V, --version
 ```
 
 `--min-confidence` defaults to zero. Low-confidence word boxes can still carry

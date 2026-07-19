@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  linux:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install stable Rust and musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Set release version
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "TESSERACT_TO_MARKDOWN_BUILD_VERSION=v${crate_version}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Verify executable
+        run: |
+          binary="target/${{ matrix.target }}/release/tesseract-to-markdown"
+          "$binary" --version
+          "$binary" fixtures/synthetic-invoice-handwriting-bleedthrough.tsv > actual.md
+          cmp fixtures/synthetic-invoice-handwriting-bleedthrough.expected.md actual.md
+      - name: Package
+        run: |
+          package="tesseract-to-markdown-${{ matrix.asset }}"
+          mkdir "$package"
+          install -m 0755 "target/${{ matrix.target }}/release/tesseract-to-markdown" "$package/"
+          cp LICENSE README.md "$package/"
+          printf '%s\n' "$TESSERACT_TO_MARKDOWN_BUILD_VERSION" > "$package/VERSION"
+          tar -czf "$package.tar.gz" "$package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tesseract-to-markdown-${{ matrix.asset }}
+          path: tesseract-to-markdown-${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    needs: validate
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install stable Rust targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Set release version
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "TESSERACT_TO_MARKDOWN_BUILD_VERSION=v${crate_version}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+      - name: Build both macOS architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Create and sign universal executable
+        run: |
+          arm_binary="target/aarch64-apple-darwin/release/tesseract-to-markdown"
+          intel_binary="target/x86_64-apple-darwin/release/tesseract-to-markdown"
+          universal_binary="target/tesseract-to-markdown-universal"
+          codesign --force --sign - "$arm_binary"
+          codesign --force --sign - "$intel_binary"
+          lipo -create "$arm_binary" "$intel_binary" -output "$universal_binary"
+          codesign --force --sign - "$universal_binary"
+          lipo -verify_arch arm64 x86_64 "$universal_binary"
+          codesign --verify --strict "$universal_binary"
+      - name: Verify native and universal executables
+        run: |
+          arm_binary="target/aarch64-apple-darwin/release/tesseract-to-markdown"
+          universal_binary="target/tesseract-to-markdown-universal"
+          "$arm_binary" --version
+          "$universal_binary" --version
+          "$universal_binary" fixtures/synthetic-invoice-handwriting-bleedthrough.tsv > actual.md
+          cmp fixtures/synthetic-invoice-handwriting-bleedthrough.expected.md actual.md
+      - name: Package
+        run: |
+          for asset in macos-aarch64 macos-x86_64 macos-universal; do
+            package="tesseract-to-markdown-$asset"
+            mkdir "$package"
+            cp LICENSE README.md "$package/"
+            printf '%s\n' "$TESSERACT_TO_MARKDOWN_BUILD_VERSION" > "$package/VERSION"
+            case "$asset" in
+              macos-aarch64)
+                binary="target/aarch64-apple-darwin/release/tesseract-to-markdown"
+                ;;
+              macos-x86_64)
+                binary="target/x86_64-apple-darwin/release/tesseract-to-markdown"
+                ;;
+              macos-universal)
+                binary="target/tesseract-to-markdown-universal"
+                ;;
+            esac
+            install -m 0755 "$binary" "$package/tesseract-to-markdown"
+            tar -czf "$package.tar.gz" "$package"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tesseract-to-markdown-macos
+          path: tesseract-to-markdown-macos-*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs:
+      - linux
+      - macos
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Prepare release
+        id: release
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          tag="v${crate_version}-build.${GITHUB_RUN_NUMBER}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          mapfile -t archives < <(find dist -maxdepth 1 -type f -name '*.tar.gz' -print | sort)
+          test "${#archives[@]}" -eq 5
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+
+          cat > release-notes.md <<EOF
+          Automated binary release for commit \`${GITHUB_SHA}\`.
+
+          Download the archive for the target machine, extract it, and put
+          \`tesseract-to-markdown\` on \`PATH\`.
+
+          - \`linux-x86_64\`: static Linux binary for Intel/AMD servers
+          - \`linux-aarch64\`: static Linux binary for ARM64 servers
+          - \`macos-universal\`: recommended macOS binary for Intel and Apple Silicon
+          - \`macos-aarch64\`: Apple Silicon-only macOS binary
+          - \`macos-x86_64\`: Intel-only macOS binary
+
+          Verify downloads with \`SHA256SUMS\`.
+          EOF
+      - name: Create or repair GitHub release
+        run: |
+          tag="${{ steps.release.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$tag" \
+              --latest \
+              --notes-file release-notes.md \
+              --title "$tag" \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* \
+              --latest \
+              --notes-file release-notes.md \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

@@ -17,7 +17,12 @@ Options:
   --table-min-rows N        Minimum rows required for a table (default: 3)
   --page-headings           Include explicit page headings
   --stats                   Print conversion statistics to stderr
+  -V, --version             Show the version
   -h, --help                Show this help"
+}
+
+fn version() -> &'static str {
+    option_env!("TESSERACT_TO_MARKDOWN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 fn parse_value<T: std::str::FromStr>(
@@ -67,6 +72,10 @@ fn run() -> Result<(), String> {
         match argument.as_str() {
             "-h" | "--help" => {
                 println!("{}", usage());
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("tesseract-to-markdown {}", version());
                 return Ok(());
             }
             "--min-confidence" => {
