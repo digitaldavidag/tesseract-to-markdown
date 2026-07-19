@@ -107,7 +107,7 @@ jobs:
           codesign --force --sign - "$intel_binary"
           lipo -create "$arm_binary" "$intel_binary" -output "$universal_binary"
           codesign --force --sign - "$universal_binary"
-          lipo -verify_arch arm64 x86_64 "$universal_binary"
+          lipo "$universal_binary" -verify_arch arm64 x86_64
           codesign --verify --strict "$universal_binary"
       - name: Verify native and universal executables
         run: |
