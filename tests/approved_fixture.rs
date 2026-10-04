@@ -113,7 +113,10 @@ fn table_models_expose_supported_regions_and_provenance() {
         .expect("low-confidence unit qualifier");
     assert_eq!(low_confidence_unit.column_index, Some(7));
     assert!(low_confidence_unit.recognition_confidence < 50.0);
-    assert!(!low_confidence_unit.words.is_empty());
+    assert_ne!(
+        low_confidence_unit.words,
+        [] as [tesseract_to_markdown::TableWordProvenance; 0]
+    );
 }
 
 #[test]
@@ -161,5 +164,8 @@ fn confidence_filter_does_not_remove_structural_word_boxes() {
                 && cell.recognition_confidence < 50.0
         })
         .expect("filtered unit box still supports the final column");
-    assert!(!structural_only_unit.words.is_empty());
+    assert_ne!(
+        structural_only_unit.words,
+        [] as [tesseract_to_markdown::TableWordProvenance; 0]
+    );
 }
